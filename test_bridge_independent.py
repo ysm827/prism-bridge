@@ -56,6 +56,13 @@ class IndependentAcceptanceTests(unittest.TestCase):
             "snapshot": {"codex_session_id": "audit-session", "transcript_cursor": 2},
         }
 
+    def test_max_and_ultra_are_not_downgraded_to_high(self):
+        for effort in ("max", "ultra"):
+            with self.subTest(effort=effort):
+                self.assertEqual(bridge.effort_of({"reasoning": {"effort": effort}, "reasoning_effort": "low"}), effort)
+                self.assertEqual(bridge.effort_of({"reasoning_effort": effort.upper()}), effort)
+        self.assertEqual(bridge.effort_of({"reasoning_effort": "xhigh"}), "high")
+
     def test_legacy_six_part_success_retains_entire_raw_history(self):
         history = "A" * 100000
         current = "B" * 200000

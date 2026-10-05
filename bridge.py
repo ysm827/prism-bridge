@@ -2061,7 +2061,7 @@ def effort_of(body: dict) -> str:
     else:
         raw = "high"
     e = raw.strip().lower()
-    if e in ("xhigh", "max", "ultra", "highest"):
+    if e in ("xhigh", "highest"):
         return "high"
     if e in ("minimal", "min"):
         return "low"
