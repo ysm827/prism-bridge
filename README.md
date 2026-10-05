@@ -16,7 +16,7 @@
 
 ## 功能
 
-- **一键登录**：弹出浏览器，登录后凭证保存在本机。
+- **一键登录**：Windows 优先直接拉起系统 Chrome/Edge（不由 Playwright 托管），完成登录并关闭窗口后凭证保存在本机；没有系统浏览器时才使用 Playwright 窗口。
 - **图形界面**：一个窗口里登录、启动/停止服务、看日志；也可以纯命令行使用。
 - **两套接口**：`/v1/responses` 和 `/v1/chat/completions`，都支持 SSE 流式。
 - **工具调用**：客户端带的工具（`function`、`custom` 自由文本、`namespace` 分组、Codex CLI 的 `additional_tools`）由桥中继给模型，调用结果回到客户端，在**客户端那台机器**上执行，不使用 Prism 自带的云端沙箱。
@@ -45,7 +45,7 @@ Windows 双击 `prism.cmd`，按数字键选择：
 | :--- | :--- | :--- |
 | `1` 图形界面 | `python gui.py` | 登录、启动/停止服务、日志都在一个窗口 |
 | `2` 启动服务 | `python bridge.py serve` | 在控制台窗口里运行服务 |
-| `3` 登录 | `python bridge.py login` | 弹出浏览器，登录成功后自动保存凭证并关闭 |
+| `3` 登录 | `python bridge.py login` | 打开登录浏览器；完成登录后关闭窗口，程序读取并保存会话 |
 | `4` 查看状态 | `python bridge.py status` | 账号、会话剩余有效期、端口状态 |
 
 Linux / macOS 直接用右边一列的命令。
@@ -55,7 +55,7 @@ Linux / macOS 直接用右边一列的命令。
 图形界面的几点行为：
 
 - 关闭窗口会停止服务。
-- 服务运行中点“重新登录”，会先停服务，登录结束后自动重新启动（两者共用同一份浏览器数据）。
+- Windows 登录默认使用未由 Playwright 接管的系统 Chrome，其次 Edge；看到 Prism 编辑器后关闭该窗口，程序才读取会话。系统浏览器不可用时才退回 Playwright 有头登录。
 - 图形界面和控制台方式不能同时运行服务。
 
 ## 接入客户端
@@ -208,16 +208,20 @@ python bridge.py serve
 新版 Windows 登录优先使用系统 Chrome，再选 Edge，均未安装才用 bundled Chromium。只在浏览器未安装时继续尝试；profile 占用、权限或其它启动错误保留原始报错，不会删除 profile、Cookie 或强杀浏览器。服务模式默认不变。显式设置 `PRISM_BROWSER_CHANNEL` 时尊重该选择，失败不自动换浏览器。
 
 **登录弹出 `auth.openai.com`「正在验证您是否是真人」/ `Just a moment...`，或 JSON 解析报 `Unexpected token '<'`（Issue #1）**
-这是登录/授权阶段拿到了 HTML，不是桥把 Cookie 解析错。本机同一次对照：Playwright 自带 Chromium 点「Continue with OpenAI」后，`GET /api/accounts/authorize` 返回 **403 `text/html`**，标题 `Just a moment...`；系统 Chrome 同一台机器是 **302 → `/log-in` 200**（正常邮箱登录页）。两种启动 `navigator.webdriver` 都是 `true`，去掉 `--enable-automation` 仍是 `true`，所以不能单凭自动化标记解释。
+这是登录/授权阶段拿到了 HTML，不是桥把 Cookie 解析错。Playwright 托管窗口在本机曾出现 `GET /api/accounts/authorize` 返回 **403 `text/html`**，标题 `Just a moment...`，授权弹窗会反复刷新；系统 Chrome 同机可走到正常登录页。
 
-Windows 登录已默认走系统 Chrome，通常不再撞自带 Chromium 这条 403 HTML。若仍出现该页：先看日常 Chrome 能否打开 `prism.openai.com` / `auth.openai.com`；需要登录和服务都用系统 Chrome 时，在同一终端设置后启动：
+新版 Windows 登录默认直接启动系统 Chrome，其次 Edge，**不由 Playwright 接管登录窗口**。看到真人验证时，在该窗口等待验证完成，不要反复点击「使用 OpenAI 继续」；看到 Prism 编辑器后关闭这个登录窗口，程序再读取 Profile 中的会话并保存。服务模式仍使用 Playwright 无头浏览器。
+
+如果仍出现真人验证：先确认日常 Chrome 能否打开 `prism.openai.com` 和 `auth.openai.com`，并确保两个域名走同一条能用的线路。换浏览器不是绕过验证的保证；若普通浏览器也持续验证或打不开，是网络/IP/账号风险控制，需要停止反复重试并稍后再试。
+
+显式指定登录通道时：
 
 ```powershell
 $env:PRISM_BROWSER_CHANNEL = "chrome"
 python gui.py
 ```
 
-或设置后依次执行 `python bridge.py login`、`python bridge.py serve`。系统 Chrome 仍使用本项目独立的 profile，不是日常浏览器的默认个人资料。换浏览器不是绕过验证的保证。
+系统 Chrome 使用本项目独立的 profile，不是日常浏览器的默认个人资料。关闭登录窗口前不会写入 `auth.json`。
 
 
 **启动报 `net::ERR_CONNECTION_CLOSED`**

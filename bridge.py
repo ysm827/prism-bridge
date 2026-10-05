@@ -23,6 +23,7 @@ import queue
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -3552,6 +3553,210 @@ def cmd_status() -> None:
     print("=" * 64)
 
 
+def _login_channels() -> tuple:
+    channel = os.environ.get("PRISM_BROWSER_CHANNEL", "").strip()
+    if channel:
+        return (channel,)
+    if os.name == "nt":
+        return ("chrome", "msedge", None)
+    return (None,)
+
+
+def _windows_app_path(exe_name: str) -> str | None:
+    if os.name != "nt":
+        return None
+    import winreg
+
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        if not value:
+            continue
+        path = Path(str(value).strip().strip('"'))
+        if path.is_file():
+            return str(path)
+    return None
+
+
+_CHANNEL_WIN_REL = {
+    "chrome": Path("Google") / "Chrome" / "Application" / "chrome.exe",
+    "msedge": Path("Microsoft") / "Edge" / "Application" / "msedge.exe",
+    "edge": Path("Microsoft") / "Edge" / "Application" / "msedge.exe",
+}
+_CHANNEL_WHICH = {
+    "chrome": ("google-chrome", "google-chrome-stable", "chrome", "chromium-browser"),
+    "msedge": ("microsoft-edge", "microsoft-edge-stable", "msedge"),
+    "edge": ("microsoft-edge", "microsoft-edge-stable", "msedge"),
+}
+_CHANNEL_APP_EXE = {"chrome": "chrome.exe", "msedge": "msedge.exe", "edge": "msedge.exe"}
+
+
+def _browser_executable(channel: str | None) -> str | None:
+    if not channel or channel in ("chromium", "chrome-for-testing"):
+        return None
+    app_exe = _CHANNEL_APP_EXE.get(channel)
+    if app_exe:
+        found = _windows_app_path(app_exe)
+        if found:
+            return found
+    rel = _CHANNEL_WIN_REL.get(channel)
+    if rel and os.name == "nt":
+        for root_key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            root = os.environ.get(root_key)
+            if not root:
+                continue
+            candidate = Path(root) / rel
+            if candidate.is_file():
+                return str(candidate)
+    for name in _CHANNEL_WHICH.get(channel, (channel,)):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _profile_browser_locked() -> bool:
+    for name in ("lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"):
+        if (PROFILE_DIR / name).exists():
+            return True
+    return False
+
+
+def _cookie_session_ready(cookie: str) -> dict | None:
+    if not cookie or "prism_oai_access_token" not in cookie:
+        return None
+    claims = get_token_claims(cookie)
+    if claims.get("user_id") and token_expiry(cookie) > time.time() + 60:
+        return claims
+    return None
+
+
+def _commit_login_cookie(cookie: str) -> bool:
+    claims = _cookie_session_ready(cookie)
+    if not claims:
+        return False
+    save_auth_cookie(cookie)
+    print("=" * 64)
+    print("【登录成功！】会话凭证已成功提取并保存至本地。")
+    print(f"  用户 ID: {claims.get('user_id')}")
+    if claims.get("expires_at"):
+        exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(claims["expires_at"]))
+        print(f"  有效期至: {exp_str}")
+    print(f"  凭据文件: {AUTH_FILE}")
+    print("=" * 64)
+    return True
+
+
+def _looks_like_challenge(page) -> bool:
+    try:
+        url = page.url or ""
+        title = page.title() or ""
+    except Exception:
+        return False
+    url_l = url.lower()
+    title_l = title.lower()
+    if "challenges.cloudflare.com" in url_l or "just a moment" in title_l:
+        return True
+    if "正在验证" in title or "verify you are human" in title_l:
+        return True
+    return "auth.openai.com" in url_l and "请稍候" in title
+
+
+def _harvest_profile_cookies(channel: str | None) -> str:
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(PROFILE_DIR),
+                    headless=True,
+                    args=["--no-first-run", "--no-default-browser-check"],
+                    **({"channel": channel} if channel else {}),
+                )
+                try:
+                    return context_cookie_header(context)
+                finally:
+                    context.close()
+        except PlaywrightError as exc:
+            last_error = exc
+            print(f"[login] 读取会话失败 ({attempt}/3): {str(exc)[:120]}", flush=True)
+            time.sleep(2)
+    if last_error:
+        raise last_error
+    return ""
+
+
+def _launch_unmanaged_login_browser():
+    """Open installed Chrome/Edge without Playwright so Cloudflare JS can finish.
+
+    Playwright-controlled windows keep failing the auth.openai.com human check and
+    the authorize popup reloads. Bundled Chromium still uses the Playwright path.
+    """
+    explicit = os.environ.get("PRISM_BROWSER_CHANNEL", "").strip()
+    for candidate in _login_channels():
+        if candidate is None or candidate in ("chromium", "chrome-for-testing"):
+            return None, None
+        exe = _browser_executable(candidate)
+        if not exe:
+            if explicit:
+                raise PlaywrightError(f"Executable doesn't exist at path for channel {candidate}")
+            print(f"[login] 未安装 {candidate}，尝试下一个浏览器", flush=True)
+            continue
+        print(f"[login] 启动系统 {candidate}（非 Playwright 托管）", flush=True)
+        try:
+            proc = subprocess.Popen(
+                [
+                    exe,
+                    f"--user-data-dir={PROFILE_DIR}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--new-window",
+                    ORIGIN + "/",
+                ]
+            )
+        except FileNotFoundError:
+            if explicit:
+                raise PlaywrightError(f"Executable doesn't exist at path {exe}") from None
+            print(f"[login] 未安装 {candidate}，尝试下一个浏览器", flush=True)
+            continue
+        return candidate, proc
+    return None, None
+
+
+def _finish_unmanaged_login(proc, channel: str | None) -> None:
+    print("\n[等待登录完成] 已打开系统浏览器（未由自动化框架接管）。")
+    print("若弹出「正在验证您是否是真人」或 Just a moment：在该窗口里等它自己完成，不要关闭，不要反复点「使用 OpenAI 继续」。")
+    print("看到 Prism 编辑器之后，关闭这个登录浏览器窗口；程序会读取会话并保存。\n", flush=True)
+    deadline = time.time() + 1800
+    last_note = 0.0
+    time.sleep(1.5)
+    if proc.poll() is not None:
+        print("[login] 浏览器把窗口交给了已有实例。请在那个登录窗口完成登录，然后关掉它。", flush=True)
+    while time.time() < deadline:
+        alive = proc.poll() is None
+        locked = _profile_browser_locked()
+        if not alive and not locked:
+            time.sleep(1.0)
+            cookie = _harvest_profile_cookies(channel)
+            if _commit_login_cookie(cookie):
+                print("浏览器窗口已关闭，会话已保存。")
+                return
+            print("\n[提示] 窗口已关闭，但没有读到有效会话。请再登录一次。")
+            return
+        now = time.time()
+        if now - last_note >= 30:
+            print("[login] 仍在等待：完成真人验证与登录后，关闭登录窗口。", flush=True)
+            last_note = now
+        time.sleep(1)
+    print("\n[提示] 30 分钟内未关闭登录窗口，已放弃等待。")
+    if proc.poll() is None:
+        proc.terminate()
+
+
 def _launch_login_context(p):
     """Use an explicit channel, or installed Windows browsers before bundled Chromium.
 
@@ -3559,9 +3764,7 @@ def _launch_login_context(p):
     skip missing browsers: retrying a locked or otherwise failing profile in
     several different browsers can hide the actual error.
     """
-    channel = os.environ.get("PRISM_BROWSER_CHANNEL", "").strip()
-    channels = (channel,) if channel else (("chrome", "msedge", None) if os.name == "nt" else (None,))
-    for candidate in channels:
+    for candidate in _login_channels():
         label = candidate or "bundled Chromium"
         print(f"[login] 启动 {label}", flush=True)
         try:
@@ -3576,7 +3779,8 @@ def _launch_login_context(p):
             missing = "Executable doesn't exist" in message or (
                 "distribution" in message.lower() and "not found" in message.lower()
             )
-            if channel or candidate is None or not missing:
+            explicit = os.environ.get("PRISM_BROWSER_CHANNEL", "").strip()
+            if explicit or candidate is None or not missing:
                 raise
             print(f"[login] 未安装 {candidate}，尝试下一个浏览器", flush=True)
 
@@ -3589,6 +3793,11 @@ def cmd_login() -> None:
     print(f"本地 Profile 路径: {PROFILE_DIR}")
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    channel, proc = _launch_unmanaged_login_browser()
+    if proc is not None:
+        _finish_unmanaged_login(proc, channel)
+        return
+
     with sync_playwright() as p:
         context = _launch_login_context(p)
 
@@ -3601,32 +3810,30 @@ def cmd_login() -> None:
         page.goto(ORIGIN + "/", wait_until="domcontentloaded")
 
         print("\n[等待登录完成] 窗口已就绪，请在浏览器中完成登录（支持 Google/微软/邮箱等）。")
+        print("若弹出真人验证：在该窗口等待完成，不要关闭，不要反复点「使用 OpenAI 继续」。")
         print("检测到登录成功并进入 Prism 界面后，程序将自动固化会话并关闭浏览器...\n")
 
+        warned_cf = False
         saved = False
-        claims: dict = {}
-        for second in range(300):
+        for _second in range(300):
             time.sleep(1)
-            cookies = context.cookies()
-            names = [c["name"] for c in cookies]
-            if "prism_oai_access_token" in names:
-                cookie_parts = [f"{c['name']}={c['value']}" for c in cookies if ".openai.com" in c.get("domain", "")]
-                full_cookie = "; ".join(cookie_parts)
-                claims = get_token_claims(full_cookie)
-                if claims.get("user_id") and token_expiry(full_cookie) > time.time() + 60:
-                    save_auth_cookie(full_cookie)
-                    saved = True
-                    break
+            if not warned_cf:
+                try:
+                    pages = list(context.pages)
+                except Exception:
+                    pages = []
+                if any(_looks_like_challenge(item) for item in pages):
+                    print(
+                        "[login] 检测到真人验证页。请在该窗口等待完成，不要关闭，也不要反复点击「使用 OpenAI 继续」。",
+                        flush=True,
+                    )
+                    warned_cf = True
+            cookie = context_cookie_header(context)
+            if _commit_login_cookie(cookie):
+                saved = True
+                break
 
         if saved:
-            print("=" * 64)
-            print("【登录成功！】会话凭证已成功提取并保存至本地。")
-            print(f"  用户 ID: {claims.get('user_id')}")
-            if claims.get("expires_at"):
-                exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(claims["expires_at"]))
-                print(f"  有效期至: {exp_str}")
-            print(f"  凭据文件: {AUTH_FILE}")
-            print("=" * 64)
             print("浏览器窗口将在 3 秒后自动关闭...")
             time.sleep(3)
         else:

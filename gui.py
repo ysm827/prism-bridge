@@ -306,7 +306,7 @@ class App:
         if self._alive("login"):
             self.account_dot.config(foreground=AMBER)
             self.account_text.config(text="等待在浏览器里完成登录…")
-            self.account_detail.config(text="登录成功后浏览器会自动关闭，最多等待 5 分钟。")
+            self.account_detail.config(text="弹出真人验证时请等待，不要反复点击。看到 Prism 编辑器后关闭登录窗口以保存。")
             self.account_expiry.config(text="")
             self.login_btn.config(text="取消登录")
             return
